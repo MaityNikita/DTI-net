@@ -906,65 +906,114 @@ def fetch_uniprot_sequence(uniprot_id: str, fallback_seq: str = "") -> str:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_chembl_compounds(target_symbol: str, uniprot_id: str, fallback_json: str = "[]") -> list[dict]:
-    """Fetch ChEMBL compounds (clinical phase >= 2, max 50) with SMILES and experimental pKd."""
+def fetch_chembl_compounds(
+    target_symbol: str,
+    uniprot_id: str,
+    fallback_json: str = "[]",
+    prefer_fallback: bool = False,
+) -> tuple[list[dict], str]:
+    """Fetch phase 2+ compounds in batches, with bundled demo data as a fallback."""
     fallback_compounds = json.loads(fallback_json) if fallback_json else []
-    compounds = []
+    fallback = [dict(compound) for compound in fallback_compounds[:50]]
+    if prefer_fallback and fallback:
+        return fallback, "bundled_cache"
+    if not uniprot_id:
+        return fallback, "bundled_fallback" if fallback else "unavailable"
+
     try:
-        if uniprot_id:
-            t_resp = requests.get(
-                f"https://www.ebi.ac.uk/chembl/api/data/target.json?target_components__accession={uniprot_id}&limit=1",
-                timeout=6,
-            )
-            targets = t_resp.json().get("targets", []) if t_resp.status_code == 200 else []
-            if targets:
-                chembl_tid = targets[0]["target_chembl_id"]
-                m_resp = requests.get(
-                    f"https://www.ebi.ac.uk/chembl/api/data/mechanism.json?target_chembl_id={chembl_tid}&limit=50",
-                    timeout=8,
-                )
-                mechs = m_resp.json().get("mechanisms", []) if m_resp.status_code == 200 else []
-                seen_ids = []
-                for m in mechs:
-                    mol_id = m.get("molecule_chembl_id")
-                    if mol_id and mol_id not in seen_ids:
-                        seen_ids.append(mol_id)
-                for mol_id in seen_ids[:50]:
-                    mol_r = requests.get(f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json", timeout=5)
-                    if mol_r.status_code != 200:
-                        continue
-                    mol_j = mol_r.json()
-                    phase = mol_j.get("max_phase") or 0
+        base_url = "https://www.ebi.ac.uk/chembl/api/data"
+        timeout = (3, 10)
+        target_response = requests.get(
+            f"{base_url}/target.json",
+            params={"target_components__accession": uniprot_id, "limit": 1},
+            timeout=timeout,
+        )
+        if target_response.status_code != 200:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+        targets = target_response.json().get("targets", [])
+        if not targets:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+
+        chembl_target_id = targets[0].get("target_chembl_id")
+        if not chembl_target_id:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+
+        mechanism_response = requests.get(
+            f"{base_url}/mechanism.json",
+            params={"target_chembl_id": chembl_target_id, "limit": 50},
+            timeout=timeout,
+        )
+        if mechanism_response.status_code != 200:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+        mechanisms = mechanism_response.json().get("mechanisms", [])
+        molecule_ids = list(dict.fromkeys(
+            mechanism.get("molecule_chembl_id")
+            for mechanism in mechanisms
+            if mechanism.get("molecule_chembl_id")
+        ))[:50]
+        if not molecule_ids:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+
+        molecule_response = requests.get(
+            f"{base_url}/molecule.json",
+            params={"molecule_chembl_id__in": ",".join(molecule_ids), "limit": 50},
+            timeout=timeout,
+        )
+        if molecule_response.status_code != 200:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+        molecules = molecule_response.json().get("molecules", [])
+
+        compounds = []
+        eligible_molecules = []
+        for molecule in molecules:
+            try:
+                phase = int(float(molecule.get("max_phase") or 0))
+            except (TypeError, ValueError):
+                phase = 0
+            smiles = (molecule.get("molecule_structures") or {}).get("canonical_smiles")
+            if phase < 2 or not smiles:
+                continue
+            molecule_id = molecule.get("molecule_chembl_id", "")
+            eligible_molecules.append(molecule)
+            compounds.append({
+                "name": molecule.get("pref_name") or molecule_id,
+                "smiles": smiles,
+                "max_phase": phase,
+                "exp_pkd": None,
+            })
+
+        if not compounds:
+            return fallback, "bundled_fallback" if fallback else "unavailable"
+
+        activities_response = requests.get(
+            f"{base_url}/activity.json",
+            params={
+                "target_chembl_id": chembl_target_id,
+                "molecule_chembl_id__in": ",".join(
+                    molecule["molecule_chembl_id"]
+                    for molecule in molecules
+                    if molecule.get("molecule_chembl_id")
+                ),
+                "pchembl_value__isnull": "false",
+                "limit": 1000,
+            },
+            timeout=timeout,
+        )
+        if activities_response.status_code == 200:
+            pkd_by_molecule = {}
+            for activity in activities_response.json().get("activities", []):
+                molecule_id = activity.get("molecule_chembl_id")
+                value = activity.get("pchembl_value")
+                if molecule_id and molecule_id not in pkd_by_molecule and value is not None:
                     try:
-                        phase = int(float(phase))
-                    except Exception:
-                        phase = 0
-                    if phase < 2:
+                        pkd_by_molecule[molecule_id] = round(float(value), 2)
+                    except (TypeError, ValueError):
                         continue
-                    structs = mol_j.get("molecule_structures") or {}
-                    smi = structs.get("canonical_smiles")
-                    if not smi:
-                        continue
-                    name = mol_j.get("pref_name") or mol_id
-                    exp_pkd = None
-                    try:
-                        act_r = requests.get(
-                            f"https://www.ebi.ac.uk/chembl/api/data/activity.json?target_chembl_id={chembl_tid}&molecule_chembl_id={mol_id}&pchembl_value__isnull=false&limit=1",
-                            timeout=5,
-                        )
-                        acts = act_r.json().get("activities", []) if act_r.status_code == 200 else []
-                        if acts and acts[0].get("pchembl_value") is not None:
-                            exp_pkd = round(float(acts[0]["pchembl_value"]), 2)
-                    except Exception:
-                        pass
-                    compounds.append({"name": name, "smiles": smi, "max_phase": phase, "exp_pkd": exp_pkd})
-                    if len(compounds) >= 50:
-                        break
-    except Exception:
-        pass
-    if compounds:
-        return compounds[:50]
-    return [dict(c) for c in fallback_compounds][:50]
+            for compound, molecule in zip(compounds, eligible_molecules):
+                compound["exp_pkd"] = pkd_by_molecule.get(molecule.get("molecule_chembl_id"))
+        return compounds[:50], "chembl_api"
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return fallback, "bundled_fallback" if fallback else "unavailable"
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1790,7 +1839,14 @@ with tab_disease:
 
     run_disease_btn = st.button("Run disease screening", use_container_width=True, key="run_disease_btn")
 
+    if run_disease_btn and not effective_query:
+        st.session_state.pop("disease_results_df", None)
+        st.session_state.pop("disease_query_ran", None)
+        st.warning("Enter a disease or target name before running screening.")
+
     if run_disease_btn and effective_query:
+        st.session_state.pop("disease_results_df", None)
+        st.session_state.pop("disease_query_ran", None)
         targets, source = resolve_disease_targets(effective_query)
         if not targets:
             st.warning(f"No targets resolved for '{effective_query}'. Try a demo disease or a standard target symbol.")
@@ -1800,16 +1856,19 @@ with tab_disease:
 
             # Step 1: Fetch sequence + ChEMBL compounds per target, and compute ESM-2 embedding ONCE per target
             target_bundles = []
+            compound_sources = set()
             total_pairs = 0
             for t in targets[:5]:
                 seq = fetch_uniprot_sequence(t.get("uniprot_id", ""), t.get("sequence", ""))
                 if not seq:
                     continue
-                compounds = fetch_chembl_compounds(
+                compounds, compound_source = fetch_chembl_compounds(
                     t["symbol"],
                     t.get("uniprot_id", ""),
                     json.dumps(t.get("compounds", [])),
+                    prefer_fallback=source in {"local_cache_demo", "local_cache_fallback"},
                 )
+                compound_sources.add(compound_source)
                 if not compounds:
                     continue
                 prot_emb = compute_esm2_embedding(t["symbol"], seq)
@@ -1822,8 +1881,26 @@ with tab_disease:
                 })
                 total_pairs += len(compounds[:50])
 
+            source_labels = {
+                "chembl_api": "ChEMBL",
+                "bundled_cache": "bundled demo cache",
+                "bundled_fallback": "bundled fallback",
+                "unavailable": "unavailable",
+            }
+            st.session_state["disease_compound_source"] = " + ".join(
+                source_labels[source_name]
+                for source_name in ("chembl_api", "bundled_fallback", "unavailable")
+                if source_name in compound_sources
+            )
+            if "bundled_cache" in compound_sources:
+                st.info("Using bundled compounds for the selected demo disease; screening does not depend on ChEMBL availability.")
+            elif "bundled_fallback" in compound_sources:
+                st.info("ChEMBL did not return usable compounds for every target; bundled demo compounds were used where available.")
+
             if total_pairs == 0:
-                st.warning("Resolved targets had no phase 2+ ChEMBL compounds with SMILES.")
+                st.warning(
+                    "No screenable compounds were found. Check the target's UniProt sequence and ChEMBL data, or try a bundled demo disease."
+                )
             else:
                 prog = st.progress(0, text="Running DTI-Net across resolved drug-target pairs...")
                 rows = []
@@ -1864,7 +1941,7 @@ with tab_disease:
         src_lbl = st.session_state.get("disease_source", "cache")
         t_list = ", ".join(st.session_state.get("disease_targets_resolved", []))
         st.markdown(
-            f'<div class="note-box">Query: <strong>{st.session_state.get("disease_query_ran", "")}</strong> | Targets: <strong>{t_list}</strong> | Source: <code>{src_lbl}</code> | Pairs screened: <strong>{len(df_full)}</strong></div>',
+            f'<div class="note-box">Query: <strong>{st.session_state.get("disease_query_ran", "")}</strong> | Targets: <strong>{t_list}</strong> | Target source: <code>{src_lbl}</code> | Compound source: <code>{st.session_state.get("disease_compound_source", "unknown")}</code> | Pairs screened: <strong>{len(df_full)}</strong></div>',
             unsafe_allow_html=True,
         )
 

@@ -30,4 +30,4 @@ python -m pytest -q
 
 Keep credentials out of Git. Local `.env` files and `.streamlit/secrets.toml` are ignored; configure any future deployment secrets in the hosting platform's secret manager instead.
 
-The bundled `disease_cache.json` provides local reference data for disease screening. Network-dependent lookups require outbound access to the public services listed above.
+The bundled `disease_cache.json` provides offline demo diseases, target sequences, and compound lists. Custom disease/target lookups use Open Targets, UniProt, and batched ChEMBL requests; if ChEMBL is unavailable, bundled compounds are used when available. The disease-screening UI reports which compound source it used.
